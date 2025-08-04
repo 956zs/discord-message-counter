@@ -27,12 +27,13 @@ module.exports = {
 
       // 從資料庫查詢該伺服器的前 10 名使用者
       const query = `
-                SELECT user_id, count
-                FROM message_counts
-                WHERE guild_id = $1
-                ORDER BY count DESC
-                LIMIT 10;
-            `;
+          SELECT user_id, SUM(count) AS total_count
+          FROM message_counts
+          WHERE guild_id = $1
+          GROUP BY user_id
+          ORDER BY total_count DESC
+          LIMIT 10;
+      `;
       const { rows } = await pool.query(query, [guildId]);
 
       if (rows.length === 0) {
@@ -51,9 +52,9 @@ module.exports = {
         rows.map(async (row, index) => {
           try {
             const user = await interaction.client.users.fetch(row.user_id);
-            return `${index + 1}. ${user.tag} - **${row.count}** 則訊息`;
+            return `${index + 1}. ${user.tag} - **${row.total_count}** 則訊息`;
           } catch {
-            return `${index + 1}. *未知使用者* - **${row.count}** 則訊息`;
+            return `${index + 1}. *未知使用者* - **${row.total_count}** 則訊息`;
           }
         })
       );

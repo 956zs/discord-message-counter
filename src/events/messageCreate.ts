@@ -12,14 +12,18 @@ module.exports = {
       // 如果使用者在該伺服器的紀錄已存在，則將 count + 1
       // 如果不存在，則新增一筆紀錄，count 設為 1
       const query = `
-                INSERT INTO message_counts (user_id, guild_id, count)
-                VALUES ($1, $2, 1)
-                ON CONFLICT (user_id, guild_id)
-                DO UPDATE SET count = message_counts.count + 1;
-            `;
+          INSERT INTO message_counts (user_id, guild_id, channel_id, count)
+          VALUES ($1, $2, $3, 1)
+          ON CONFLICT (user_id, guild_id, channel_id)
+          DO UPDATE SET count = message_counts.count + 1;
+      `;
 
       // 執行查詢
-      await pool.query(query, [message.author.id, message.guild.id]);
+      await pool.query(query, [
+        message.author.id,
+        message.guild.id,
+        message.channel.id,
+      ]);
     } catch (error) {
       console.error("在 messageCreate 事件中更新資料庫時發生錯誤:", error);
     }
