@@ -3,6 +3,7 @@ import "dotenv/config";
 import fs from "node:fs";
 import path from "node:path";
 import { Client, Collection, GatewayIntentBits } from "discord.js";
+import { flushDirtyCountsToDB } from "./database/write-behind";
 
 // 為了讓 client 物件可以被附加 commands 屬性，我們需要擴充 Client 類別
 // 這是一種常見的 TypeScript 實踐
@@ -72,4 +73,15 @@ const token = process.env.DISCORD_TOKEN;
 if (!token) {
   throw new Error("DISCORD_TOKEN 未在 .env 檔案中設定！");
 }
-client.login(token);
+client.login(token).then(() => {
+  // 設定每 30 秒執行一次批次寫入資料庫的任務
+  const WRITE_BEHIND_INTERVAL = 30 * 1000; // 30 秒
+  setInterval(() => {
+    flushDirtyCountsToDB();
+  }, WRITE_BEHIND_INTERVAL);
+  console.log(
+    `[Write-Behind] 已啟動定時寫入任務，每 ${
+      WRITE_BEHIND_INTERVAL / 1000
+    } 秒執行一次。`
+  );
+});

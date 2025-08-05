@@ -1,26 +1,27 @@
 import { Events, Message } from "discord.js";
-import { pool } from "../database";
 import { redis } from "../database/redis";
+
+const DIRTY_COUNTS_PREFIX = "dirty_counts:";
 
 module.exports = {
   name: Events.MessageCreate,
   async execute(message: Message) {
     if (message.author.bot || !message.guild) return;
 
-    const { author, guild } = message;
+    const { author, guild, channel } = message;
 
     try {
-      // 1. 更新 PostgreSQL (權威數據源)
-      // 我們可以簡化，不再需要事務，因為 Redis 的更新失敗是可接受的
-      const query = `
-        INSERT INTO message_counts (user_id, guild_id, channel_id, count)
-        VALUES ($1, $2, $3, 1)
-        ON CONFLICT (user_id, guild_id, channel_id)
-        DO UPDATE SET count = message_counts.count + 1;
-      `;
-      await pool.query(query, [author.id, guild.id, message.channel.id]);
+      // --- Write-Behind Caching with New Schema ---
+      // 1. 建立一個複合鍵，包含 user, channel, 和 date
+      const today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+      const compositeKey = `${author.id}:${channel.id}:${today}`;
 
-      // 2. ★ 更新 Redis 排行榜 Sorted Set
+      // 2. 將增量寫入 "dirty" hash
+      // 我們仍然使用 guild.id 作為 hash 的主鍵，但欄位現在是複合鍵
+      const dirtyKey = `${DIRTY_COUNTS_PREFIX}${guild.id}`;
+      await redis.hincrby(dirtyKey, compositeKey, 1);
+
+      // 2. ★ 即時更新 Redis 排行榜 Sorted Set (用於即時檢視)
       // ZINCRBY: 將指定成員的分數加 1
       // 這個操作極快，對效能影響微乎其微
       const leaderboardKey = `leaderboard:${guild.id}`;

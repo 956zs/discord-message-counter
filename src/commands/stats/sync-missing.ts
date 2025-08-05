@@ -4,6 +4,7 @@ import {
   PermissionFlagsBits,
   ChannelType,
   TextChannel,
+  MessageFlags,
 } from "discord.js";
 import { pool } from "../../database";
 import { redis } from "../../database/redis";
@@ -20,11 +21,11 @@ module.exports = {
     if (!interaction.guild || !interaction.user) {
       return interaction.reply({
         content: "此指令發生了非預期的錯誤。",
-        ephemeral: true,
+        flags: MessageFlags.Ephemeral,
       });
     }
 
-    await interaction.deferReply({ ephemeral: true });
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
     const guild = interaction.guild;
     const dbClient = await pool.connect();
@@ -138,13 +139,13 @@ module.exports = {
 
       await interaction.followUp({
         content: `✅ 增量同步完成！共補全了 **${totalSynced}** 則遺漏的訊息。`,
-        ephemeral: true,
+        flags: MessageFlags.Ephemeral,
       });
     } catch (error) {
       console.error("執行 sync-missing 時發生錯誤:", error);
       await interaction.followUp({
         content: "❌ 增量同步失敗，請檢查後台日誌。",
-        ephemeral: true,
+        flags: MessageFlags.Ephemeral,
       });
     } finally {
       dbClient.release();

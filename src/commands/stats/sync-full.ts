@@ -6,9 +6,13 @@ import {
   TextChannel,
   EmbedBuilder,
   Message,
+  VoiceChannel,
+  ThreadChannel,
+  MessageFlags,
 } from "discord.js";
 import { pool } from "../../database";
 import { redis } from "../../database/redis";
+import { flushDirtyCountsToDB } from "../../database/write-behind";
 
 const delay = (ms: number) => new Promise((res) => setTimeout(res, ms));
 
@@ -22,7 +26,7 @@ module.exports = {
     if (!interaction.guild || !interaction.user || !interaction.channel) {
       return interaction.reply({
         content: "此指令發生了非預期的錯誤。",
-        ephemeral: true,
+        flags: MessageFlags.Ephemeral,
       });
     }
 
@@ -30,7 +34,7 @@ module.exports = {
     await interaction.reply({
       content:
         "⚠️ **極度危險操作！**\n這將會刪除本伺服器所有訊息計數，並從頭開始同步，可能需要數小時。\n**你確定要繼續嗎？** (請在 15 秒內於此頻道回覆 `confirm` )",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
 
     const filter = (m: Message) =>
@@ -51,23 +55,29 @@ module.exports = {
           await interaction.followUp({
             content:
               "✅ 確認收到，完全同步任務即將開始... 請留意私訊獲取進度。",
-            ephemeral: true,
+            flags: MessageFlags.Ephemeral,
           });
       } else {
         return interaction.followUp({
           content: "❌ 此指令無法在此頻道中使用。",
-          ephemeral: true,
+          flags: MessageFlags.Ephemeral,
         });
       }
     } catch {
       return interaction.followUp({
         content: "❌ 操作已取消。",
-        ephemeral: true,
+        flags: MessageFlags.Ephemeral,
       });
     }
 
     const guild = interaction.guild;
     const user = interaction.user;
+
+    // ★★★ 在開始同步前，強制將所有待寫入的 Redis 數據刷入資料庫 ★★★
+    console.log("[Sync-Full] 正在強制執行一次性的批次寫入以同步最新數據...");
+    await flushDirtyCountsToDB();
+    console.log("[Sync-Full] 批次寫入完成，即將開始完全同步。");
+
     const dbClient = await pool.connect();
     const lockKey = `sync-lock:${interaction.guildId}`;
     const lockTimeout = 3600;
@@ -84,7 +94,7 @@ module.exports = {
       const holderId = await redis.get(lockKey);
       return interaction.followUp({
         content: `❌ 目前已有一個同步任務正在由 <@${holderId}> 執行中，請稍後再試。`,
-        ephemeral: true,
+        flags: MessageFlags.Ephemeral,
       });
     }
 
@@ -108,18 +118,53 @@ module.exports = {
         guild.id,
       ]);
 
-      const channels = Array.from(
-        guild.channels.cache
-          .filter(
-            (ch): ch is TextChannel =>
-              ch.type === ChannelType.GuildText && ch.viewable
-          )
-          .values()
+      // --- Comprehensive Channel Fetching ---
+      type TextBasedChannel = TextChannel | VoiceChannel;
+      type MessageableChannel = TextBasedChannel | ThreadChannel;
+
+      progressEmbed.setDescription("正在獲取所有可讀取頻道列表...");
+      await progressMessage.edit({ embeds: [progressEmbed] });
+
+      // 1. Get base text channels
+      const baseChannels: TextBasedChannel[] = guild.channels.cache
+        .filter(
+          (ch): ch is TextBasedChannel =>
+            (ch.type === ChannelType.GuildText ||
+              ch.type === ChannelType.GuildAnnouncement ||
+              ch.type === ChannelType.GuildVoice) &&
+            ch.viewable &&
+            ch.permissionsFor(guild.members.me!)?.has("ReadMessageHistory")
+        )
+        .map((c: TextBasedChannel) => c);
+
+      // 2. Fetch all threads in the guild
+      const allThreads = guild.channels.cache
+        .filter(
+          (ch) =>
+            ch.isThread() &&
+            ch.viewable &&
+            ch.permissionsFor(guild.members.me!)?.has("ReadMessageHistory")
+        )
+        .map((t) => t as ThreadChannel);
+
+      // 3. Merge and deduplicate
+      const allMessageableChannels: MessageableChannel[] = [
+        ...baseChannels,
+        ...allThreads,
+      ];
+      const uniqueChannels = new Map<string, MessageableChannel>();
+      allMessageableChannels.forEach((ch: MessageableChannel) =>
+        uniqueChannels.set(ch.id, ch)
       );
-      const totalChannels = channels.length;
+      const finalChannelList = Array.from(uniqueChannels.values());
+
+      const totalChannels = finalChannelList.length;
+      console.log(
+        `[Sync-Full] 找到 ${totalChannels} 個獨特的可訊息頻道進行同步。`
+      );
 
       for (let i = 0; i < totalChannels; i++) {
-        const channel = channels[i];
+        const channel = finalChannelList[i];
         const elapsedTime = (Date.now() - startTime) / 1000;
         const estimatedTime =
           (elapsedTime / (i + 1)) * (totalChannels - (i + 1));
@@ -154,25 +199,39 @@ module.exports = {
           });
           if (messages.size === 0) break;
 
-          const counts: { [userId: string]: number } = {};
+          // New data structure: { 'YYYY-MM-DD': { 'userId': count } }
+          const dailyCounts: { [date: string]: { [userId: string]: number } } =
+            {};
+
           for (const msg of messages.values()) {
             if (msg.author.bot) continue;
-            counts[msg.author.id] = (counts[msg.author.id] || 0) + 1;
+            const messageDate = msg.createdAt.toISOString().slice(0, 10);
+            if (!dailyCounts[messageDate]) {
+              dailyCounts[messageDate] = {};
+            }
+            dailyCounts[messageDate][msg.author.id] =
+              (dailyCounts[messageDate][msg.author.id] || 0) + 1;
           }
 
-          if (Object.keys(counts).length > 0) {
+          if (Object.keys(dailyCounts).length > 0) {
             await dbClient.query("BEGIN");
-            for (const userId in counts) {
-              const query = `
-                            INSERT INTO message_counts (user_id, guild_id, channel_id, count) VALUES ($1, $2, $3, $4)
-                            ON CONFLICT (user_id, guild_id, channel_id) DO UPDATE SET count = message_counts.count + $4;
-                        `;
-              await dbClient.query(query, [
-                userId,
-                guild.id,
-                channel.id,
-                counts[userId],
-              ]);
+            for (const date in dailyCounts) {
+              for (const userId in dailyCounts[date]) {
+                const count = dailyCounts[date][userId];
+                const query = `
+                  INSERT INTO message_counts (user_id, guild_id, channel_id, message_date, count)
+                  VALUES ($1, $2, $3, $4, $5)
+                  ON CONFLICT (user_id, guild_id, channel_id, message_date)
+                  DO UPDATE SET count = message_counts.count + $5;
+                `;
+                await dbClient.query(query, [
+                  userId,
+                  guild.id,
+                  channel.id,
+                  date,
+                  count,
+                ]);
+              }
             }
             await dbClient.query("COMMIT");
           }
@@ -203,8 +262,11 @@ module.exports = {
       // 3. 使用 ZADD 批量寫入 Redis Sorted Set
       if (rows.length > 0) {
         // Redis 的 ZADD 命令可以一次接收多個 [score, member] 對
-        const redisArgs = rows.flatMap((row) => [row.total_count, row.user_id]);
-        await redis.zadd(leaderboardKey, ...redisArgs);
+        const redisArgs = rows.flatMap((row) => [
+          parseInt(row.total_count, 10),
+          row.user_id,
+        ]);
+        await redis.zadd(leaderboardKey, ...(redisArgs as (string | number)[]));
         console.log(
           `[Sync] 成功將 ${rows.length} 條用戶排名數據重建到 Redis。`
         );

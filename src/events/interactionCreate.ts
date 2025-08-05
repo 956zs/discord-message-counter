@@ -1,4 +1,4 @@
-import { Events, Interaction } from "discord.js";
+import { Events, Interaction, MessageFlags } from "discord.js";
 
 module.exports = {
   name: Events.InteractionCreate,
@@ -25,12 +25,12 @@ module.exports = {
       if (interaction.replied || interaction.deferred) {
         await interaction.followUp({
           content: "執行此指令時發生錯誤！",
-          ephemeral: true,
+          flags: MessageFlags.Ephemeral,
         });
       } else {
         await interaction.reply({
           content: "執行此指令時發生錯誤！",
-          ephemeral: true,
+          flags: MessageFlags.Ephemeral,
         });
       }
     }

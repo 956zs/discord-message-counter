@@ -16,3 +16,11 @@ pool.on("error", (err, client) => {
   console.error("資料庫連線池發生未預期的錯誤", err);
   process.exit(-1);
 });
+
+export interface MessageCount {
+  user_id: string;
+  guild_id: string;
+  channel_id: string;
+  message_date: string;
+  count: number;
+}

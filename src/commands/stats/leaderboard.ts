@@ -7,8 +7,11 @@ import {
   ButtonStyle,
   ComponentType,
   Message,
+  ChannelType,
+  MessageFlags,
 } from "discord.js";
 import { redis } from "../../database/redis";
+import { pool } from "../../database";
 
 const ITEMS_PER_PAGE = 10;
 const CACHE_TTL_SECONDS = 300; // 5 分鐘快取
@@ -35,32 +38,124 @@ const getLeaderboardPageData = async (guildId: string, page: number) => {
   return data;
 };
 
+const getFilteredLeaderboardFromDB = async (
+  guildId: string,
+  page: number,
+  userId: string,
+  channelId?: string,
+  date?: string | null
+) => {
+  const offset = (page - 1) * ITEMS_PER_PAGE;
+  const whereClauses: string[] = ["guild_id = $1"];
+  const values: (string | number)[] = [guildId];
+  let valueCounter = 2;
+
+  if (channelId) {
+    whereClauses.push(`channel_id = $${valueCounter++}`);
+    values.push(channelId);
+  }
+  if (date) {
+    whereClauses.push(`message_date = $${valueCounter++}`);
+    values.push(date);
+  }
+
+  const whereString = whereClauses.join(" AND ");
+
+  const dataQuery = `
+    SELECT user_id, SUM(count)::bigint as total_count
+    FROM message_counts
+    WHERE ${whereString}
+    GROUP BY user_id
+    ORDER BY total_count DESC
+    LIMIT ${ITEMS_PER_PAGE}
+    OFFSET ${offset};
+  `;
+
+  const totalQuery = `SELECT COUNT(DISTINCT user_id) as total_users FROM message_counts WHERE ${whereString};`;
+
+  const rankQuery = `
+    WITH user_ranks AS (
+      SELECT user_id, RANK() OVER (ORDER BY SUM(count) DESC) as rank
+      FROM message_counts
+      WHERE ${whereString}
+      GROUP BY user_id
+    )
+    SELECT rank FROM user_ranks WHERE user_id = $${valueCounter};
+  `;
+  values.push(userId);
+
+  const client = await pool.connect();
+  try {
+    const [dataResult, totalResult, rankResult] = await Promise.all([
+      client.query(dataQuery, values.slice(0, valueCounter - 1)),
+      client.query(totalQuery, values.slice(0, valueCounter - 1)),
+      client.query(rankQuery, values),
+    ]);
+
+    return {
+      rows: dataResult.rows,
+      totalCount: parseInt(totalResult.rows[0]?.total_users || "0", 10),
+      userRank: rankResult.rows[0]
+        ? parseInt(rankResult.rows[0].rank, 10)
+        : null,
+    };
+  } finally {
+    client.release();
+  }
+};
+
 const generateLeaderboardEmbed = async (
   interaction: ChatInputCommandInteraction,
   page: number
 ): Promise<{ embed: EmbedBuilder; row: ActionRowBuilder<ButtonBuilder> }> => {
   const guildId = interaction.guildId!;
-  const leaderboardKey = `leaderboard:${guildId}`;
-  const pageCacheKey = `leaderboard:page:${guildId}:${page}`;
+  const channel = interaction.options.getChannel("channel");
+  const date = interaction.options.getString("date");
 
-  let embedData: any; // 用於儲存 Embed 所需的數據
+  // --- Dynamic Cache Key ---
+  const filterSuffix = `${channel ? `_ch:${channel.id}` : ""}${
+    date ? `_date:${date}` : ""
+  }`;
+  const pageCacheKey = `leaderboard:page:${guildId}:${page}${filterSuffix}`;
+
+  let embedData: any;
   const cachedData = await redis.get(pageCacheKey);
 
   if (cachedData) {
-    // ★ 快取命中！直接從 Redis 讀取
     embedData = JSON.parse(cachedData);
   } else {
-    // ★ 快取未命中！從 Redis Sorted Set (或 PostgreSQL) 計算
+    // --- Data Fetching Logic ---
+    let rows, totalUsers, userRank;
 
-    const totalUsers = await redis.zcard(leaderboardKey); // ZCARD: 獲取 Sorted Set 的成員總數
+    if (channel || date) {
+      // ** DB-based filtered leaderboard **
+      const {
+        rows: dbRows,
+        totalCount,
+        userRank: dbUserRank,
+      } = await getFilteredLeaderboardFromDB(
+        guildId,
+        page,
+        interaction.user.id,
+        channel?.id,
+        date
+      );
+      rows = dbRows;
+      totalUsers = totalCount;
+      userRank = dbUserRank;
+    } else {
+      // ** Redis-based global leaderboard **
+      const leaderboardKey = `leaderboard:${guildId}`;
+      rows = await getLeaderboardPageData(guildId, page);
+      totalUsers = await redis.zcard(leaderboardKey);
+      const rank = await redis.zrevrank(leaderboardKey, interaction.user.id);
+      userRank = rank !== null ? rank + 1 : null;
+    }
+
     const totalPages = Math.ceil(totalUsers / ITEMS_PER_PAGE) || 1;
 
-    const rows = await getLeaderboardPageData(guildId, page);
-
-    const userRank = await redis.zrevrank(leaderboardKey, interaction.user.id); // ZREVRANK: 獲取成員的排名 (從 0 開始)
-
     const description = rows
-      .map((row, index) => {
+      .map((row: any, index: number) => {
         const rank = (page - 1) * ITEMS_PER_PAGE + index + 1;
         return `${rank}. <@${row.user_id}> - **${row.total_count}** 則訊息`;
       })
@@ -68,16 +163,18 @@ const generateLeaderboardEmbed = async (
 
     embedData = {
       description:
-        description.length > 0 ? description : "這個伺服器還沒有訊息紀錄！",
+        description.length > 0 ? description : "找不到符合條件的訊息紀錄！",
       footer: {
-        text: `你的排名: ${userRank !== null ? userRank + 1 : "N/A"} | 你在第 ${
-          userRank !== null ? Math.ceil((userRank + 1) / ITEMS_PER_PAGE) : "N/A"
+        text: `你的排名: ${userRank || "N/A"} | 你在第 ${
+          userRank ? Math.ceil(userRank / ITEMS_PER_PAGE) : "N/A"
         } 頁`,
       },
       totalPages: totalPages,
+      title: `👑 ${interaction.guild!.name} ${
+        channel ? `#${channel.name} ` : ""
+      }${date ? `${date} ` : ""}訊息排行榜`,
     };
 
-    // 將新生成的數據寫入快取，並設置 TTL
     await redis.set(
       pageCacheKey,
       JSON.stringify(embedData),
@@ -87,7 +184,7 @@ const generateLeaderboardEmbed = async (
   }
 
   const embed = new EmbedBuilder()
-    .setTitle(`👑 ${interaction.guild!.name} 訊息排行榜 (高速版)`)
+    .setTitle(`👑 ${interaction.guild!.name} 訊息排行榜`)
     .setColor("Gold")
     .setDescription(embedData.description)
     .setFooter(embedData.footer);
@@ -116,7 +213,24 @@ const generateLeaderboardEmbed = async (
 module.exports = {
   data: new SlashCommandBuilder()
     .setName("leaderboard")
-    .setDescription("顯示伺服器訊息排行榜"),
+    .setDescription("顯示伺服器訊息排行榜")
+    .addChannelOption((option) =>
+      option
+        .setName("channel")
+        .setDescription("只看特定頻道的排行榜")
+        .addChannelTypes(
+          ChannelType.GuildText,
+          ChannelType.GuildVoice,
+          ChannelType.GuildAnnouncement
+        )
+        .setRequired(false)
+    )
+    .addStringOption((option) =>
+      option
+        .setName("date")
+        .setDescription("只看特定日期的排行榜 (格式: YYYY-MM-DD)")
+        .setRequired(false)
+    ),
 
   async execute(interaction: ChatInputCommandInteraction) {
     if (!interaction.guild) return;
@@ -127,11 +241,11 @@ module.exports = {
       currentPage
     );
 
-    const response: Message = await interaction.reply({
+    await interaction.reply({
       embeds: [initialData.embed],
       components: [initialData.row],
-      fetchReply: true,
     });
+    const response = await interaction.fetchReply();
 
     const collector = response.createMessageComponentCollector({
       componentType: ComponentType.Button,
@@ -140,7 +254,10 @@ module.exports = {
 
     collector.on("collect", async (i) => {
       if (i.user.id !== interaction.user.id) {
-        await i.reply({ content: "這不是給你的按鈕！", ephemeral: true });
+        await i.reply({
+          content: "這不是給你的按鈕！",
+          flags: MessageFlags.Ephemeral,
+        });
         return;
       }
 
