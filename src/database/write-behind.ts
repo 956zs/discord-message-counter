@@ -92,9 +92,9 @@ export async function flushDirtyCountsToDB() {
         const query = `
           INSERT INTO message_counts (user_id, guild_id, channel_id, message_date, count)
           SELECT
-            t.user_id,
-            $1 AS guild_id,
-            t.channel_id,
+            t.user_id::bigint,
+            $1::bigint AS guild_id,
+            t.channel_id::bigint,
             t.message_date::date,
             t.count
           FROM UNNEST(

@@ -10,9 +10,13 @@ import {
   ThreadChannel,
   MessageFlags,
 } from "discord.js";
+import { Worker } from "worker_threads";
+import * as path from "path";
+import * as os from "os";
 import { pool } from "../../database";
 import { redis } from "../../database/redis";
 import { flushDirtyCountsToDB } from "../../database/write-behind";
+import { MessageCount } from "../../database";
 
 const delay = (ms: number) => new Promise((res) => setTimeout(res, ms));
 
@@ -163,81 +167,115 @@ module.exports = {
         `[Sync-Full] 找到 ${totalChannels} 個獨特的可訊息頻道進行同步。`
       );
 
-      for (let i = 0; i < totalChannels; i++) {
-        const channel = finalChannelList[i];
-        const elapsedTime = (Date.now() - startTime) / 1000;
-        const estimatedTime =
-          (elapsedTime / (i + 1)) * (totalChannels - (i + 1));
+      const numWorkers = Math.min(os.cpus().length, totalChannels);
+      const channelsPerWorker = Math.ceil(totalChannels / numWorkers);
+      const channelChunks: MessageableChannel[][] = [];
 
-        const progress = Math.round(((i + 1) / totalChannels) * 100);
-        const progressBar =
-          "█".repeat(Math.round(progress / 5)) +
-          "░".repeat(20 - Math.round(progress / 5));
+      for (let i = 0; i < totalChannels; i += channelsPerWorker) {
+        channelChunks.push(finalChannelList.slice(i, i + channelsPerWorker));
+      }
 
-        progressEmbed
-          .setTitle(`🔄 同步進行中... (${progress}%)`)
-          .setDescription(
-            `**進度**: ${progressBar}\n` +
-              `**頻道**: #${channel.name} (${i + 1} / ${totalChannels})\n` +
-              `**耗時**: ${Math.floor(elapsedTime / 60)}分 ${Math.round(
-                elapsedTime % 60
-              )}秒\n` +
-              `**預計剩餘**: ${Math.floor(estimatedTime / 60)}分 ${Math.round(
-                estimatedTime % 60
-              )}秒`
+      console.log(
+        `[Sync-Full] Spawning ${numWorkers} workers to process ${totalChannels} channels.`
+      );
+
+      let totalMessagesProcessed = 0;
+      let channelsCompleted = 0;
+
+      const workerPromises = channelChunks.map((chunk, index) => {
+        return new Promise<MessageCount[]>((resolve, reject) => {
+          const worker = new Worker(
+            path.resolve(__dirname, "../../workers/sync-worker.js"),
+            {
+              workerData: {
+                channelIds: chunk.map((ch) => ch.id),
+                token: interaction.client.token,
+                guildId: guild.id,
+              },
+            }
           );
 
-        if (i % 5 === 0 || i === totalChannels - 1) {
-          await progressMessage.edit({ embeds: [progressEmbed] });
-        }
+          worker.on(
+            "message",
+            (result: {
+              counts?: MessageCount[];
+              error?: string;
+              type?: string;
+              progress?: any;
+            }) => {
+              if (result.type === "progress") {
+                // Handle progress updates if implemented in worker
+              } else if (result.error) {
+                console.error(`[Worker ${index}] Error:`, result.error);
+                // Depending on desired behavior, you might reject or resolve with empty
+              } else if (result.counts) {
+                channelsCompleted += chunk.length;
+                const progress = Math.round(
+                  (channelsCompleted / totalChannels) * 100
+                );
+                const progressBar =
+                  "█".repeat(Math.round(progress / 5)) +
+                  "░".repeat(20 - Math.round(progress / 5));
+                const elapsedTime = (Date.now() - startTime) / 1000;
 
-        let lastId: string | undefined;
-        while (true) {
-          const messages = await channel.messages.fetch({
-            limit: 100,
-            before: lastId,
-          });
-          if (messages.size === 0) break;
+                progressEmbed
+                  .setTitle(`🔄 同步進行中... (${progress}%)`)
+                  .setDescription(
+                    `**進度**: ${progressBar}\n` +
+                      `**頻道**: ${channelsCompleted} / ${totalChannels} 個已完成\n` +
+                      `**耗時**: ${Math.floor(elapsedTime / 60)}分 ${Math.round(
+                        elapsedTime % 60
+                      )}秒`
+                  );
+                progressMessage
+                  .edit({ embeds: [progressEmbed] })
+                  .catch(console.error);
 
-          // New data structure: { 'YYYY-MM-DD': { 'userId': count } }
-          const dailyCounts: { [date: string]: { [userId: string]: number } } =
-            {};
-
-          for (const msg of messages.values()) {
-            if (msg.author.bot) continue;
-            const messageDate = msg.createdAt.toISOString().slice(0, 10);
-            if (!dailyCounts[messageDate]) {
-              dailyCounts[messageDate] = {};
-            }
-            dailyCounts[messageDate][msg.author.id] =
-              (dailyCounts[messageDate][msg.author.id] || 0) + 1;
-          }
-
-          if (Object.keys(dailyCounts).length > 0) {
-            await dbClient.query("BEGIN");
-            for (const date in dailyCounts) {
-              for (const userId in dailyCounts[date]) {
-                const count = dailyCounts[date][userId];
-                const query = `
-                  INSERT INTO message_counts (user_id, guild_id, channel_id, message_date, count)
-                  VALUES ($1, $2, $3, $4, $5)
-                  ON CONFLICT (user_id, guild_id, channel_id, message_date)
-                  DO UPDATE SET count = message_counts.count + $5;
-                `;
-                await dbClient.query(query, [
-                  userId,
-                  guild.id,
-                  channel.id,
-                  date,
-                  count,
-                ]);
+                resolve(result.counts);
               }
             }
-            await dbClient.query("COMMIT");
-          }
-          lastId = messages.lastKey();
-          await delay(1000);
+          );
+
+          worker.on("error", reject);
+          worker.on("exit", (code) => {
+            if (code !== 0) {
+              reject(
+                new Error(`Worker ${index} stopped with exit code ${code}`)
+              );
+            }
+          });
+        });
+      });
+
+      const allCounts = (await Promise.all(workerPromises)).flat();
+
+      console.log(
+        `[Sync-Full] All workers finished. Aggregated ${allCounts.length} total records.`
+      );
+
+      if (allCounts.length > 0) {
+        console.log("[Sync-Full] Writing aggregated data to PostgreSQL...");
+        const BATCH_SIZE = 1000; // Insert 1000 records at a time
+        await dbClient.query("BEGIN");
+        for (let i = 0; i < allCounts.length; i += BATCH_SIZE) {
+          const batch = allCounts.slice(i, i + BATCH_SIZE);
+          const values = batch
+            .map(
+              (c) =>
+                `(${c.user_id}, ${c.guild_id}, ${c.channel_id}, '${c.message_date}', ${c.count})`
+            )
+            .join(",");
+
+          const query = `
+                INSERT INTO message_counts (user_id, guild_id, channel_id, message_date, count)
+                VALUES ${values}
+                ON CONFLICT (user_id, guild_id, channel_id, message_date)
+                DO UPDATE SET count = message_counts.count + excluded.count;
+            `;
+          await dbClient.query(query);
         }
+        await dbClient.query("COMMIT");
+        console.log("[Sync-Full] Database write complete.");
       }
 
       const endTime = Date.now();
