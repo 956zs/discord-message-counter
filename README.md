@@ -1,6 +1,8 @@
-![Message Counter Pro Banner](https://db.nlcat.dpdns.org/banner-twitter-1500x500%20(7).png)
 
-# Discord Message counter
+![Message Counter Pro Banner](https://db.nlcat.dpdns.org/banner-twitter-1500x500%20(7).png)
+<h1 align="center">Discord Message counter</h1>
+<h3 align="center"></h3>
+
 
 這是一款專為大型 Discord 伺服器設計的高效能訊息計數機器人。它採用了先進的快取策略與非同步處理架構，能夠在不影響機器人回應速度的前提下，精確、即時地統計伺服器內所有成員的訊息數量，並提供互動式的排行榜功能。
 
